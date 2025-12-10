@@ -5,22 +5,24 @@ import { vendorsAPI } from "@/services/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { useToast } from "@/hooks/use-toast";
-import { Loader2, Upload, FileSpreadsheet, LogOut, CheckCircle, Clock } from "lucide-react";
+import { Loader2, Upload, FileSpreadsheet, LogOut, Package } from "lucide-react";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Badge } from "@/components/ui/badge";
 
-interface Upload {
-  id: string;
-  file_name: string;
-  status: string;
-  uploaded_at: string;
+interface Product {
+  product_id: string;
+  product_name: string;
+  brand: string;
+  price: string;
+  stock_quantity: number;
+  is_available: boolean;
 }
 
 const VendorDashboard = () => {
   const [loading, setLoading] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [uploads, setUploads] = useState<Upload[]>([]);
+  const [products, setProducts] = useState<Product[]>([]);
   const [vendorName, setVendorName] = useState("");
   const [isApproved, setIsApproved] = useState<boolean | null>(null);
   const navigate = useNavigate();
@@ -34,7 +36,7 @@ const VendorDashboard = () => {
     }
     setVendorName(user.name || user.email || "Vendor");
     checkApprovalStatus();
-    fetchUploads();
+    fetchProducts();
   }, [isAuthenticated, user, navigate]);
 
   const checkApprovalStatus = async () => {
@@ -56,16 +58,16 @@ const VendorDashboard = () => {
     }
   };
 
-  const fetchUploads = async () => {
+  const fetchProducts = async () => {
     setLoading(true);
     try {
-      const data = await vendorsAPI.getUploads();
-      setUploads(data || []);
+      const data = await vendorsAPI.getVendorProducts();
+      setProducts(data || []);
     } catch (error: any) {
-      console.error("Error fetching uploads:", error);
+      console.error("Error fetching products:", error);
       toast({
         title: "Error",
-        description: error.message || "Failed to load uploads",
+        description: error.message || "Failed to load products",
         variant: "destructive",
       });
     } finally {
@@ -104,10 +106,10 @@ const VendorDashboard = () => {
 
       toast({
         title: "Upload successful",
-        description: "Your file has been uploaded and will be processed shortly",
+        description: "Your products have been imported successfully",
       });
 
-      fetchUploads();
+      fetchProducts();
     } catch (error: any) {
       toast({
         title: "Upload failed",
@@ -190,9 +192,12 @@ const VendorDashboard = () => {
 
           <Card className="border-2">
             <CardHeader>
-              <CardTitle>Upload History</CardTitle>
+              <CardTitle className="flex items-center gap-2">
+                <Package className="h-5 w-5" />
+                My Products
+              </CardTitle>
               <CardDescription>
-                View your recent file uploads and their processing status
+                View and manage your product catalog ({products.length} products)
               </CardDescription>
             </CardHeader>
             <CardContent>
@@ -200,50 +205,42 @@ const VendorDashboard = () => {
                 <div className="text-center py-8">
                   <Loader2 className="h-8 w-8 animate-spin mx-auto" />
                 </div>
-              ) : uploads.length === 0 ? (
+              ) : products.length === 0 ? (
                 <p className="text-center py-8 text-muted-foreground">
-                  No uploads yet. Upload your first product catalog above.
+                  No products yet. Upload your first product catalog above.
                 </p>
               ) : (
-                <div className="space-y-3">
-                  {uploads.map((upload) => (
+                <div className="max-h-96 overflow-y-auto space-y-2">
+                  {products.slice(0, 20).map((product) => (
                     <div
-                      key={upload.id}
-                      className="flex items-center justify-between p-4 border rounded-lg"
+                      key={product.product_id}
+                      className="flex items-center justify-between p-3 border rounded-lg hover:bg-accent/50 transition-colors"
                     >
-                      <div className="flex items-center gap-3">
-                        <FileSpreadsheet className="h-8 w-8 text-primary" />
-                        <div>
-                          <p className="font-medium">{upload.file_name}</p>
-                          <p className="text-sm text-muted-foreground">
-                            {new Date(upload.uploaded_at).toLocaleDateString("en-US", {
-                              year: "numeric",
-                              month: "short",
-                              day: "numeric",
-                              hour: "2-digit",
-                              minute: "2-digit",
-                            })}
+                      <div className="flex items-center gap-3 flex-1">
+                        <Package className="h-5 w-5 text-primary" />
+                        <div className="flex-1">
+                          <p className="font-medium text-sm">{product.product_name}</p>
+                          <p className="text-xs text-muted-foreground">
+                            {product.brand || 'No brand'} • Stock: {product.stock_quantity}
                           </p>
                         </div>
                       </div>
-                      <Badge
-                        variant={upload.status === "processed" ? "default" : "secondary"}
-                        className="flex items-center gap-1"
-                      >
-                        {upload.status === "processed" ? (
-                          <>
-                            <CheckCircle className="h-3 w-3" />
-                            Processed
-                          </>
-                        ) : (
-                          <>
-                            <Clock className="h-3 w-3" />
-                            Pending
-                          </>
-                        )}
-                      </Badge>
+                      <div className="text-right">
+                        <p className="font-semibold text-primary">Rs. {parseFloat(product.price).toFixed(2)}</p>
+                        <Badge
+                          variant={product.is_available ? "default" : "secondary"}
+                          className="text-xs"
+                        >
+                          {product.is_available ? "Available" : "Unavailable"}
+                        </Badge>
+                      </div>
                     </div>
                   ))}
+                  {products.length > 20 && (
+                    <p className="text-center text-sm text-muted-foreground pt-2">
+                      Showing 20 of {products.length} products
+                    </p>
+                  )}
                 </div>
               )}
             </CardContent>

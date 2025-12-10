@@ -116,6 +116,20 @@ export class AuthService {
       throw new Error('Invalid email or password');
     }
 
+    // Check if vendor is approved
+    if (user.user_type === 'vendor') {
+      const vendorResult = await pool.query(
+        'SELECT is_approved FROM vendors WHERE user_id = $1',
+        [user.user_id]
+      );
+      
+      const vendor = vendorResult.rows[0];
+      
+      if (!vendor || !vendor.is_approved) {
+        throw new Error('Your vendor account is pending approval. Please contact support.');
+      }
+    }
+
     // Generate JWT token
     const token = jwt.sign(
       { userId: user.user_id, email: user.email },

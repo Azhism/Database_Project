@@ -60,8 +60,13 @@ router.get('/status', async (req: AuthRequest, res: Response) => {
 
 // File upload route - NOW REQUIRES APPROVAL
 router.post('/upload', checkVendorApproval, upload.single('file'), async (req: AuthRequest, res: Response) => {
+  console.log('📤 Upload request received');
+  console.log('User ID:', req.userId);
+  console.log('File:', req.file?.originalname);
+  
   try {
     if (!req.file) {
+      console.error('❌ No file in request');
       return res.status(400).json({ error: 'No file uploaded' });
     }
 
@@ -120,45 +125,50 @@ router.post('/upload', checkVendorApproval, upload.single('file'), async (req: A
         });
       }
 
-      // Process each product in the CSV/Excel file
-      for (const record of records) {
-        try {
-          const normalizedRecord = Object.keys(record).reduce<Record<string, any>>((acc, key) => {
-            if (!key) return acc;
-            acc[key.toString().trim().toLowerCase()] = record[key];
-            return acc;
-          }, {});
+      // Process in smaller batches to avoid overwhelming database
+      const BATCH_SIZE = 10;
+      
+      for (let i = 0; i < records.length; i += BATCH_SIZE) {
+        const batch = records.slice(i, i + BATCH_SIZE);
+        
+        // Process batch
+        for (const record of batch) {
+          try {
+            const normalizedRecord = Object.keys(record).reduce<Record<string, any>>((acc, key) => {
+              if (!key) return acc;
+              acc[key.toString().trim().toLowerCase()] = record[key];
+              return acc;
+            }, {});
 
-          const productName = normalizedRecord['product_name'] || normalizedRecord['name'] || normalizedRecord['product'];
-          const rawPrice = normalizedRecord['price'] || normalizedRecord['unit_price'];
-          const brand = normalizedRecord['brand'] || null;
-          const stock = normalizedRecord['stock'] || normalizedRecord['stock_quantity'] || normalizedRecord['qty'] || '0';
+            const productName = normalizedRecord['product_name'] || normalizedRecord['name'] || normalizedRecord['product'];
+            const rawPrice = normalizedRecord['price'] || normalizedRecord['unit_price'];
+            const brand = normalizedRecord['brand'] || null;
+            const stock = normalizedRecord['stock'] || normalizedRecord['stock_quantity'] || normalizedRecord['qty'] || '0';
 
-          const numericPrice = typeof rawPrice === 'number'
-            ? rawPrice
-            : parseFloat(String(rawPrice || '').replace(/[^0-9.\-]/g, ''));
-          const numericStock = typeof stock === 'number'
-            ? stock
-            : parseInt(String(stock || '').replace(/[^0-9\-]/g, '')) || 0;
+            const numericPrice = typeof rawPrice === 'number'
+              ? rawPrice
+              : parseFloat(String(rawPrice || '').replace(/[^0-9.\-]/g, ''));
+            const numericStock = typeof stock === 'number'
+              ? stock
+              : parseInt(String(stock || '').replace(/[^0-9\-]/g, '')) || 0;
 
-          if (!productName || isNaN(numericPrice)) {
-            errors.push(`Skipped row: missing product name or invalid price`);
-            continue;
-          }
+            if (!productName || isNaN(numericPrice)) {
+              errors.push(`Skipped row: missing product name or invalid price`);
+              continue;
+            }
 
-          // Find or create product
-          const productSearchResult = await pool.query(
-            'SELECT product_id FROM products WHERE product_name = $1 AND (brand = $2 OR (brand IS NULL AND $2 IS NULL))',
-            [productName, brand]
-          );
-
-          let product = productSearchResult.rows[0];
-
-          if (!product) {
-            // Create new product
-            const productCreateResult = await pool.query(
-              `INSERT INTO products (product_name, base_product_name, variant_name, brand, quantity_value, quantity_unit, package_size, category_id, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+            // Use UPSERT for products (INSERT ... ON CONFLICT)
+            const productResult = await pool.query(
+              `INSERT INTO products (product_name, base_product_name, variant_name, brand, quantity_value, quantity_unit, package_size, category_id)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+               ON CONFLICT (product_name, brand) 
+               DO UPDATE SET 
+                 base_product_name = EXCLUDED.base_product_name,
+                 variant_name = EXCLUDED.variant_name,
+                 quantity_value = EXCLUDED.quantity_value,
+                 quantity_unit = EXCLUDED.quantity_unit,
+                 package_size = EXCLUDED.package_size,
+                 category_id = EXCLUDED.category_id
                RETURNING product_id`,
               [
                 productName,
@@ -171,175 +181,60 @@ router.post('/upload', checkVendorApproval, upload.single('file'), async (req: A
                 normalizedRecord['category_id'] ? parseInt(normalizedRecord['category_id']) : null
               ]
             );
-            product = productCreateResult.rows[0];
-          }
 
-          // Create or update vendor listing
-          const listingSearchResult = await pool.query(
-            'SELECT listing_id FROM vendor_listings WHERE product_id = $1 AND vendor_id = $2',
-            [product.product_id, vendor.vendor_id]
-          );
+            const product = productResult.rows[0];
 
-          const existingListing = listingSearchResult.rows[0];
-
-          if (existingListing) {
+            // Use UPSERT for vendor listings too
             await pool.query(
-              `UPDATE vendor_listings
-               SET price = $1, stock_quantity = $2, is_available = true, updated_at = NOW()
-               WHERE listing_id = $3`,
-              [numericPrice, numericStock, existingListing.listing_id]
-            );
-          } else {
-            await pool.query(
-              `INSERT INTO vendor_listings (product_id, vendor_id, price, stock_quantity, is_available, created_at, updated_at)
-               VALUES ($1, $2, $3, $4, true, NOW(), NOW())`,
+              `INSERT INTO vendor_listings (product_id, vendor_id, price, stock_quantity, is_available)
+               VALUES ($1, $2, $3, $4, true)
+               ON CONFLICT (product_id, vendor_id) 
+               DO UPDATE SET 
+                 price = EXCLUDED.price,
+                 stock_quantity = EXCLUDED.stock_quantity,
+                 is_available = true,
+                 last_updated = CURRENT_TIMESTAMP`,
               [product.product_id, vendor.vendor_id, numericPrice, numericStock]
             );
-          }
 
-          productsCreated++;
-        } catch (err: any) {
-          errors.push(`Error processing product: ${err.message}`);
+            productsCreated++;
+          } catch (err: any) {
+            errors.push(`Error processing product: ${err.message}`);
+          }
+        }
+        
+        // Small delay between batches to prevent overwhelming database
+        if (i + BATCH_SIZE < records.length) {
+          await new Promise(resolve => setTimeout(resolve, 100));
         }
       }
     } catch (parseError: any) {
+      console.error('❌ Parse error:', parseError);
       return res.status(400).json({ 
         error: 'Failed to parse CSV file. Please ensure it is a valid CSV format.',
         details: parseError.message 
       });
     }
 
-    // Create upload record
-    const uploadResult = await pool.query(
-      `INSERT INTO vendor_uploads (vendor_id, file_name, file_url, status, processed_at, error_message, created_at, updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, NOW(), NOW())
-       RETURNING *`,
-      [
-        vendor.vendor_id,
-        req.file.originalname,
-        req.file.path,
-        productsCreated > 0 ? 'processed' : 'failed',
-        new Date(),
-        errors.length > 0 ? errors.join('; ') : null
-      ]
-    );
+    console.log(`✅ Upload complete! ${productsCreated} products imported`);
+    if (errors.length > 0) {
+      console.log(`⚠️ ${errors.length} errors encountered:`, errors.slice(0, 5));
+    }
 
-    const vendorUpload = uploadResult.rows[0];
-
+    // Return success response directly (no vendor_uploads table needed)
     res.json({
       message: `File uploaded successfully. ${productsCreated} products imported.`,
-      upload: vendorUpload,
       productsCreated,
       errors: errors.length > 0 ? errors : undefined,
+      status: productsCreated > 0 ? 'success' : 'failed',
     });
   } catch (error: any) {
-    console.error('Upload error:', error);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-router.post('/upload-csv', upload.single('file'), async (req: AuthRequest, res: Response) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: 'No file uploaded' });
-    }
-
-    const filePath = req.file.path;
-    let fileContent: string;
-    
-    try {
-      fileContent = await fs.readFile(filePath, 'utf-8');
-    } catch (error) {
-      // If file is binary (Excel), return error asking for CSV
-      return res.status(400).json({ error: 'Please upload a CSV file. Excel files are not supported yet.' });
-    }
-
-    // Parse CSV
-    const records = parse(fileContent, {
-      columns: true,
-      skip_empty_lines: true,
-      trim: true,
-    });
-
-    // Get vendor name from user
-    const userResult = await pool.query(
-      'SELECT name, email FROM users WHERE user_id = $1',
-      [parseInt(req.userId!)]
-    );
-
-    const user = userResult.rows[0];
-    const vendorName = user?.name || user?.email || 'Unknown Vendor';
-
-    // Process and insert products
-    const products = [];
-    for (const record of records) {
-      try {
-        const productResult = await pool.query(
-          `INSERT INTO products (product_name, category_name, brand, variant_name, package_size, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, NOW(), NOW())
-           RETURNING *`,
-          [
-            record.name || record.product_name || '',
-            record.category || '',
-            record.brand || null,
-            record.variant || null,
-            record.size || 'N/A'
-          ]
-        );
-        products.push(productResult.rows[0]);
-      } catch (error) {
-        console.error('Error creating product:', error);
-        // Continue with next product
-      }
-    }
-
-    // Create upload record (note: this route uses outdated schema, keeping minimal conversion)
-    const uploadRecordResult = await pool.query(
-      `INSERT INTO vendor_uploads (vendor_id, file_name, file_url, status, processed_at, created_at, updated_at)
-       VALUES ($1, $2, $3, 'processed', $4, NOW(), NOW())
-       RETURNING *`,
-      [parseInt(req.userId!), req.file.originalname, req.file.path, new Date()]
-    );
-
-    const vendorUpload = uploadRecordResult.rows[0];
-
-    // Clean up uploaded file
-    await fs.unlink(filePath);
-
-    res.json({
-      message: 'File processed successfully',
-      productsCreated: products.length,
-      upload: vendorUpload,
-    });
-  } catch (error: any) {
+    console.error('❌ Upload error:', error);
     res.status(500).json({ error: error.message });
   }
 });
 
 router.get('/products', async (req: AuthRequest, res: Response) => {
-  try {
-    const userResult = await pool.query(
-      'SELECT name, email FROM users WHERE user_id = $1',
-      [parseInt(req.userId!)]
-    );
-
-    const user = userResult.rows[0];
-    const vendorName = user?.name || user?.email || 'Unknown Vendor';
-
-    const productsResult = await pool.query(
-      `SELECT * FROM products
-       WHERE product_name ILIKE $1 OR brand ILIKE $1
-       ORDER BY created_at DESC`,
-      [`%${vendorName}%`]
-    );
-
-    res.json(productsResult.rows);
-  } catch (error: any) {
-    res.status(500).json({ error: error.message });
-  }
-});
-
-router.get('/uploads', async (req: AuthRequest, res: Response) => {
   try {
     // Get vendor record for this user
     const vendorResult = await pool.query(
@@ -353,16 +248,18 @@ router.get('/uploads', async (req: AuthRequest, res: Response) => {
       return res.status(404).json({ error: 'Vendor profile not found' });
     }
 
-    const uploadsResult = await pool.query(
-      `SELECT * FROM vendor_uploads
-       WHERE vendor_id = $1
-       ORDER BY uploaded_at DESC`,
+    // Get all products from this vendor's listings
+    const productsResult = await pool.query(
+      `SELECT p.*, vl.price, vl.stock_quantity, vl.is_available
+       FROM vendor_listings vl
+       JOIN products p ON vl.product_id = p.product_id
+       WHERE vl.vendor_id = $1
+       ORDER BY p.created_at DESC`,
       [vendor.vendor_id]
     );
 
-    res.json(uploadsResult.rows);
+    res.json(productsResult.rows);
   } catch (error: any) {
-    console.error('Error fetching uploads:', error);
     res.status(500).json({ error: error.message });
   }
 });

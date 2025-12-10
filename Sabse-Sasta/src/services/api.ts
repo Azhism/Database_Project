@@ -243,8 +243,12 @@ export const vendorsAPI = {
   getStatus: async () => {
     return apiRequest<{ approved: boolean; verified: boolean; vendorName: string; createdAt: string }>('/vendors/status');
   },
+  // Upload history removed - no longer tracking uploads
   getUploads: async () => {
-    return apiRequest<any[]>('/vendors/uploads');
+    return Promise.resolve([]);
+  },
+  getVendorProducts: async () => {
+    return apiRequest<any[]>('/vendors/products');
   },
   uploadFile: async (file: File) => {
     const formData = new FormData();
