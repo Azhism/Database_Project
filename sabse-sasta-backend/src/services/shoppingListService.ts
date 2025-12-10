@@ -385,7 +385,7 @@ export class ShoppingListService {
     vendorOptions: VendorOption[];
     megaOption: MegaOption;
   }> {
-    // Get the shopping list with items
+    // Validate list ownership
     const list = await this.getListById(listId, userId);
     
     if (!list.shopping_list_items || list.shopping_list_items.length === 0) {
@@ -395,303 +395,142 @@ export class ShoppingListService {
       };
     }
 
-    // Fetch vendor listings joined with vendors so we always have vendor names
-    let vendorListings: any[] = [];
+    const listIdNum = parseInt(listId, 10);
+    const totalItemsCount = list.shopping_list_items.length;
+
     try {
-      const listingsResult = await pool.query(`
-        SELECT 
-          vl.*,
-          v.vendor_name AS vendor_name
-        FROM vendor_listings vl
-        LEFT JOIN vendors v ON vl.vendor_id = v.vendor_id
-      `);
-      vendorListings = listingsResult.rows;
-    } catch (error: any) {
-      console.error('Failed to fetch vendor listings with vendor names:', error.message);
-      return {
-        vendorOptions: [],
-        megaOption: { totalCost: 0, items: [] },
-      };
-    }
+      // Optimized SQL query: Calculate total cost per vendor
+      const vendorQuery = `
+        SELECT
+          v.vendor_id,
+          v.vendor_name,
+          SUM(vl.price * sli.quantity) AS total_amount,
+          COUNT(DISTINCT sli.item_id) AS available_items,
+          json_agg(
+            json_build_object(
+              'productId', p.product_id::text,
+              'productName', p.product_name,
+              'quantity', sli.quantity,
+              'price', vl.price,
+              'total', vl.price * sli.quantity
+            )
+          ) AS items
+        FROM shopping_list_items sli
+        JOIN products p ON sli.product_id = p.product_id
+        JOIN vendor_listings vl ON p.product_id = vl.product_id
+        JOIN vendors v ON vl.vendor_id = v.vendor_id
+        WHERE sli.list_id = $1
+          AND vl.is_available = true
+        GROUP BY v.vendor_id, v.vendor_name
+        ORDER BY total_amount ASC
+      `;
 
-    if (!vendorListings || vendorListings.length === 0) {
-      console.warn('No vendor listings available for cost calculation');
-      return {
-        vendorOptions: [],
-        megaOption: { totalCost: 0, items: [] },
-      };
-    }
+      const vendorResult = await pool.query(vendorQuery, [listIdNum]);
 
-    // Fetch products for name mapping
-    const productNameMap = new Map<
-      string,
-      { display_name?: string; product_name?: string; base_product_name?: string }
-    >();
-    try {
-      const productsResult = await pool.query(`
-        SELECT product_id, display_name, product_name, base_product_name
-        FROM products
-      `);
-      productsResult.rows.forEach((product) => {
-        const id =
-          product.product_id?.toString() ||
-          product.id?.toString() ||
-          product.productId?.toString();
-        if (id) {
-          productNameMap.set(id, {
-            display_name: product.display_name,
-            product_name: product.product_name,
-            base_product_name: product.base_product_name,
-          });
-        }
-      });
-    } catch (error: any) {
-      console.warn('Failed to fetch products for name mapping:', error.message);
-    }
+      // Query for unavailable items per vendor
+      const unavailableQuery = `
+        SELECT
+          v.vendor_id,
+          array_agg(DISTINCT p.product_name) AS unavailable_items
+        FROM vendors v
+        CROSS JOIN shopping_list_items sli
+        JOIN products p ON sli.product_id = p.product_id
+        LEFT JOIN vendor_listings vl ON p.product_id = vl.product_id 
+          AND vl.vendor_id = v.vendor_id 
+          AND vl.is_available = true
+        WHERE sli.list_id = $1
+          AND vl.listing_id IS NULL
+        GROUP BY v.vendor_id
+      `;
 
-    const normalizeString = (value: any): string => {
-      if (value === null || value === undefined) return '';
-      return String(value).trim().toLowerCase();
-    };
-
-    const normalizeListingRow = (row: any) => {
-      const productId =
-        row.product_id ??
-        row.productId ??
-        row.productID ??
-        row.id ??
-        row.listing_product_id ??
-        null;
-      const productIdStr = productId ? productId.toString() : null;
-
-      const productInfo = productIdStr
-        ? productNameMap.get(productIdStr)
-        : undefined;
-
-      const displayName =
-        productInfo?.display_name ??
-        productInfo?.product_name ??
-        row.display_name ??
-        row.product_name ??
-        row.base_product_name ??
-        row.name ??
-        row.title ??
-        row.item_name ??
-        '';
-
-      const baseProductName =
-        productInfo?.base_product_name ?? row.base_product_name ?? row.base_name ?? '';
-
-      const vendorId =
-        row.vendor_id ??
-        row.vendorId ??
-        row.vendorID ??
-        row.vendor ??
-        null;
-      const vendorIdStr = vendorId ? vendorId.toString() : null;
-
-      // Vendor name should be present from the JOIN with vendors
-      let vendorNameRaw =
-        row.vendor_name ??
-        row.store_name ??
-        row.shop_name ??
-        row.seller ??
-        row.supplier ??
-        null;
-
-      if (!vendorNameRaw) {
-        vendorNameRaw = 'Unknown Vendor';
-        console.warn(
-          `Vendor name not found for vendor_id: ${vendorIdStr}, available fields:`,
-          Object.keys(row).filter((k) => k.includes('vendor') || k.includes('name'))
-        );
-      }
-
-      const priceCandidate =
-        row.price ??
-        row.listing_price ??
-        row.amount ??
-        row.unit_price ??
-        0;
-      const price = Number(priceCandidate) || 0;
-
-      return {
-        listingId: row.listing_id ?? row.id ?? null,
-        productId: productIdStr,
-        displayName: displayName || 'Unnamed Product',
-        baseProductName,
-        nameKey: normalizeString(displayName),
-        baseNameKey: normalizeString(baseProductName),
-        vendorName: vendorNameRaw || 'Unknown Vendor',
-        vendorKey: normalizeString(vendorNameRaw || 'Unknown Vendor'),
-        vendorId: vendorIdStr,
-        price,
-        stockQuantity: Number(row.stock_quantity ?? row.quantity ?? 0) || 0,
-        isAvailable:
-          row.is_available !== undefined
-            ? Boolean(row.is_available)
-            : row.in_stock !== undefined
-            ? Boolean(row.in_stock)
-            : true,
-      };
-    };
-
-    const listings = vendorListings.map(normalizeListingRow);
-
-    // Get unique vendors (keep both key + display value)
-    const vendorMap = new Map<string, string>();
-    listings.forEach((listing) => {
-      if (!vendorMap.has(listing.vendorKey)) {
-        vendorMap.set(listing.vendorKey, listing.vendorName);
-      }
-    });
-    const uniqueVendors = Array.from(vendorMap.entries());
-
-    // Calculate vendor options
-    const vendorOptions: VendorOption[] = [];
-    const megaOptionItems: MegaOption['items'] = [];
-
-    for (const [vendorKey, vendorLabel] of uniqueVendors) {
-      let totalCost = 0;
-      const vendorItems: VendorOption['items'] = [];
-      const unavailableItems: string[] = [];
-
-      for (const listItem of list.shopping_list_items) {
-        const productId = listItem.product_id || listItem.productId;
-        const quantity = listItem.quantity_value || listItem.quantity || 1;
-        
-        // Find products matching this item from this vendor
-        // Match by product_id or by name if product_id doesn't match
-        const product = listItem.products;
-        // Try multiple field names that Prisma might return
-        const productName = product?.display_name || 
-                           product?.product_name || 
-                           product?.base_product_name ||
-                           product?.name || 
-                           (product as any)?.productName ||
-                           '';
-        const baseProductName = product?.base_product_name || 
-                               (product as any)?.baseProductName ||
-                               '';
-        const productIdStr = productId ? productId.toString() : null;
-        const productNameKey = normalizeString(productName);
-        const baseNameKey = normalizeString(baseProductName);
-
-        // Find matching products from this vendor
-        const vendorProducts = listings.filter(p => 
-          p.vendorKey === vendorKey &&
-          (
-            (productIdStr && p.productId === productIdStr) ||
-            (productNameKey && p.nameKey === productNameKey) ||
-            (baseNameKey && p.baseNameKey === baseNameKey)
-          )
-        );
-
-        if (vendorProducts.length > 0) {
-          // Get the cheapest option
-          const cheapest = vendorProducts.reduce((min, p) => 
-            p.price < min.price ? p : min
-          );
-          
-          const itemTotal = cheapest.price * quantity;
-          totalCost += itemTotal;
-          
-          // Use product name from shopping list item first, then from vendor listing
-          const finalName = productName || 
-                           baseProductName ||
-                           cheapest.displayName || 
-                           'Unnamed Product';
-
-          vendorItems.push({
-            productId: cheapest.productId || productIdStr || '',
-            productName: finalName,
-            quantity,
-            price: cheapest.price,
-            total: itemTotal,
-          });
-        } else {
-          // Use the product name from the shopping list item
-          const itemName = productName || baseProductName || `Product ${productId || 'Unknown'}`;
-          unavailableItems.push(itemName);
-        }
-      }
-
-      // Show all vendors, even if they have 0 items available
-        vendorOptions.push({
-          vendor: vendorLabel,
-        totalCost,
-        availableItems: vendorItems.length,
-        totalItems: list.shopping_list_items.length,
-        items: vendorItems,
-        unavailableItems,
-      });
-    }
-
-    // Calculate mega option (optimal mix - cheapest vendor for each product)
-    let megaTotalCost = 0;
-    
-    for (const listItem of list.shopping_list_items) {
-      const productId = listItem.product_id || listItem.productId;
-      const quantity = listItem.quantity_value || listItem.quantity || 1;
+      const unavailableResult = await pool.query(unavailableQuery, [listIdNum]);
       
-      const product = listItem.products;
-      // Try multiple field names that Prisma might return
-      const productName = product?.display_name || 
-                         product?.product_name || 
-                         product?.base_product_name ||
-                         product?.name || 
-                         (product as any)?.productName ||
-                         '';
-      const baseProductName = product?.base_product_name || 
-                             (product as any)?.baseProductName ||
-                             '';
-      const productIdStr = productId ? productId.toString() : null;
-      const productNameKey = normalizeString(productName);
-      const baseNameKey = normalizeString(baseProductName);
+      // Map unavailable items by vendor
+      const unavailableMap = new Map<string, string[]>();
+      unavailableResult.rows.forEach(row => {
+        unavailableMap.set(row.vendor_id.toString(), row.unavailable_items || []);
+      });
 
-      // Find all products matching this item across all vendors
-      const matchingProducts = listings.filter(p => 
-        (productIdStr && p.productId === productIdStr) ||
-        (productNameKey && p.nameKey === productNameKey) ||
-        (baseNameKey && p.baseNameKey === baseNameKey)
-      );
+      // Build vendor options from query results
+      const vendorOptions: VendorOption[] = vendorResult.rows.map(row => ({
+        vendor: row.vendor_name,
+        totalCost: parseFloat(row.total_amount) || 0,
+        availableItems: parseInt(row.available_items) || 0,
+        totalItems: totalItemsCount,
+        items: row.items.map((item: any) => ({
+          productId: item.productId || '',
+          productName: item.productName || 'Unknown Product',
+          quantity: item.quantity || 0,
+          price: parseFloat(item.price) || 0,
+          total: parseFloat(item.total) || 0,
+        })),
+        unavailableItems: unavailableMap.get(row.vendor_id.toString()) || [],
+      }));
 
-      if (matchingProducts.length > 0) {
-        // Get the cheapest option across all vendors
-        const cheapest = matchingProducts.reduce((min, p) => 
-          p.price < min.price ? p : min
-        );
-        
-        const itemTotal = cheapest.price * quantity;
-        megaTotalCost += itemTotal;
-        
-        // Use product name from shopping list item first, then from vendor listing
-        const finalName = productName || 
-                         baseProductName ||
-                         cheapest.displayName || 
-                         'Unnamed Product';
+      // Calculate mega option: find cheapest vendor for each product
+      const megaQuery = `
+        WITH cheapest_listings AS (
+          SELECT DISTINCT ON (sli.product_id)
+            sli.product_id,
+            p.product_name,
+            sli.quantity,
+            v.vendor_name,
+            vl.price,
+            vl.price * sli.quantity AS total
+          FROM shopping_list_items sli
+          JOIN products p ON sli.product_id = p.product_id
+          JOIN vendor_listings vl ON p.product_id = vl.product_id
+          JOIN vendors v ON vl.vendor_id = v.vendor_id
+          WHERE sli.list_id = $1
+            AND vl.is_available = true
+          ORDER BY sli.product_id, vl.price ASC
+        )
+        SELECT
+          SUM(total) AS mega_total,
+          json_agg(
+            json_build_object(
+              'productId', product_id::text,
+              'productName', product_name,
+              'quantity', quantity,
+              'vendor', vendor_name,
+              'price', price,
+              'total', total
+            )
+          ) AS items
+        FROM cheapest_listings
+      `;
 
-        megaOptionItems.push({
-          productId: cheapest.productId || productIdStr || '',
-          productName: finalName,
-          quantity,
-          vendor: cheapest.vendorName,
-          price: cheapest.price,
-          total: itemTotal,
-        });
+      const megaResult = await pool.query(megaQuery, [listIdNum]);
+      
+      const megaRow = megaResult.rows[0];
+      const megaOption: MegaOption = {
+        totalCost: parseFloat(megaRow?.mega_total) || 0,
+        items: (megaRow?.items || []).map((item: any) => ({
+          productId: item.productId || '',
+          productName: item.productName || 'Unknown Product',
+          quantity: item.quantity || 0,
+          vendor: item.vendor || 'Unknown Vendor',
+          price: parseFloat(item.price) || 0,
+          total: parseFloat(item.total) || 0,
+        })),
+      };
+
+      console.log(`✅ Shopping list ${listId} cost calculation completed`);
+      console.log(`   Vendors analyzed: ${vendorOptions.length}`);
+      if (vendorOptions.length > 0) {
+        console.log(`   Cheapest vendor: ${vendorOptions[0].vendor} (Rs. ${vendorOptions[0].totalCost.toFixed(2)})`);
       }
+      console.log(`   Mega option cost: Rs. ${megaOption.totalCost.toFixed(2)}`);
+
+      return {
+        vendorOptions,
+        megaOption,
+      };
+
+    } catch (error: any) {
+      console.error('❌ Shopping list cost calculation error:', error.message);
+      throw new Error('Failed to calculate shopping list costs: ' + error.message);
     }
-
-    // Sort vendor options by total cost
-    vendorOptions.sort((a, b) => a.totalCost - b.totalCost);
-
-    return {
-      vendorOptions,
-      megaOption: {
-        totalCost: megaTotalCost,
-        items: megaOptionItems,
-      },
-    };
   }
 }
 
