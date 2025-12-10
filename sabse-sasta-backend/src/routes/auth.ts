@@ -49,11 +49,14 @@ router.post('/google', async (req: Request, res: Response) => {
 router.post('/request-reset', async (req: Request, res: Response) => {
   try {
     const { email } = req.body;
+    console.log('🔄 Password reset requested for:', email);
     if (!email) return res.status(400).json({ error: 'Email is required' });
 
     const result = await AuthService.requestPasswordReset(email);
+    console.log('✅ Password reset completed for:', email);
     res.json(result);
   } catch (error: any) {
+    console.error('❌ Password reset error:', error.message);
     res.status(500).json({ error: error.message });
   }
 });

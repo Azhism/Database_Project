@@ -39,7 +39,7 @@ router.put('/', async (req: AuthRequest, res: Response) => {
 
     const result = await pool.query(
       `UPDATE users
-       SET name = COALESCE($1, name), updated_at = NOW()
+       SET name = COALESCE($1, name)
        WHERE user_id = $2
        RETURNING user_id, email, name, user_type`,
       [fullName || null, parseInt(req.userId as string)]

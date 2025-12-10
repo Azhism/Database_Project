@@ -243,7 +243,7 @@ export class AuthService {
 
     // Update user's password in database
     await pool.query(
-      'UPDATE users SET password_hash = $1, updated_at = NOW() WHERE user_id = $2',
+      'UPDATE users SET password_hash = $1 WHERE user_id = $2',
       [hashedPassword, user.user_id]
     );
     
@@ -258,9 +258,16 @@ export class AuthService {
     
     // Send email with new password (will fail silently if SMTP not configured)
     try {
-      await EmailService.sendNewPasswordEmail(email, newPassword, user.name || undefined);
-    } catch (error) {
-      console.log('⚠️ Email sending failed (SMTP not configured). Use the password above.');
+      console.log('📧 Attempting to send email...');
+      const emailSent = await EmailService.sendNewPasswordEmail(email, newPassword, user.name || undefined);
+      if (emailSent) {
+        console.log('✅ Email sent successfully!');
+      } else {
+        console.log('❌ Email sending returned false');
+      }
+    } catch (error: any) {
+      console.log('⚠️ Email sending failed:', error.message);
+      console.log('Use the password above to login.');
     }
 
     return { message: 'If the email exists, a new password has been sent.' };
